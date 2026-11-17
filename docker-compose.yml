@@ -1,0 +1,24 @@
+services:
+  rh-sync:
+    build: .
+    container_name: rh-sync
+    volumes:
+      - rh_sync_state:/data
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      SYNC_INTERVAL_SECONDS: ${SYNC_INTERVAL_SECONDS:-60}
+    networks:
+      - rh-sync-out
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+networks:
+  rh-sync-out:
+    driver: bridge
+
+volumes:
+  rh_sync_state:
