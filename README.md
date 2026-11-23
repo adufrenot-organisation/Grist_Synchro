@@ -1,15 +1,19 @@
-# RH-SYNC Docker V3.2 — Polling sécurisé
+# RH-SYNC Docker V3.10 — Ressources, demandes et planning de présence
 
 Service Docker **sans port entrant**. Il effectue uniquement des connexions HTTPS sortantes vers Grist avec le compte technique RH-SYNC.
 
 ## Flux automatisés
 
-- `Cockpit.Team` → `Demandes.Ressources`
-- `Demandes.Demandes_RH` → `Cockpit.Demandes_RH`
-- décisions `Cockpit.Demandes_RH` → `Demandes.Demandes_RH`
-- journalisation dans `Demandes.Journal_Sync`
+- `Cockpit.Team` → `Demandes.Ressources`, avec synchronisation du nom d'équipe depuis `Team_ref.libelle` vers `Ressources.Equipe_Code` ;
+- `Demandes.Demandes_RH` → `Cockpit.Demandes_RH` ;
+- décisions `Cockpit.Demandes_RH` → `Demandes.Demandes_RH` ;
+- après une validation, relecture ciblée de `Cockpit.Presences` pour la ressource et la période concernées ;
+- `Cockpit.Presences` → `Demandes.PLANNING_PRESENCE` ;
+- consommation des lignes `EN_ATTENTE` de `Demandes.DEMANDES_SYNCHRO` ;
+- création automatique d'une demande de synchro complète de l'année selon `Demandes.PARAM_SYNCHRO` ;
+- journalisation dans `Demandes.Journal_Sync`.
 
-Le moteur utilise les UUID pour les upserts et ne supprime aucune ligne.
+Les flux historiques restent idempotents par UUID. `PLANNING_PRESENCE` est une table esclave : lors d'une synchro de période, le moteur crée/met à jour les présences et supprime les lignes source disparues dans cette période.
 
 ## Installation
 
@@ -128,3 +132,67 @@ Les emails sont envoyés **uniquement après une synchronisation réussie**.
 - Une erreur SMTP est journalisée mais ne bloque jamais la synchronisation Grist.
 
 Important : le manager est résolu via `Managers_Equipes` pour les notifications venant du portail. Pour une modification côté Cockpit, la confirmation est envoyée au manager porté par la demande.
+
+
+## Planning de présence et synchronisation pilotée — V3.8
+
+### Tables attendues côté document Demandes / Collab
+
+`PLANNING_PRESENCE` doit contenir au minimum :
+
+- `Ressource` (Ref vers `Ressources`) ;
+- `Date` ;
+- `Motif_Code` ;
+- `Statut` ;
+- `Equipe_Code` ;
+- `Derniere_Sync` ;
+- `Erreur_Sync` ;
+- une clé source : **`Source_Presence_ID` ou `Source_Feuille_ID`**.
+
+Le moteur accepte les deux noms de clé source. Si `Libelle`, `Commentaire` ou `Source` existent, ils sont également alimentés.
+
+`DEMANDES_SYNCHRO` doit contenir : `Date_Debut`, `Date_Fin`, `Type_Synchro`, `Statut`, `Demandee_Par`, `Date_Demande`, `Date_Debut_Execution`, `Date_Fin_Execution`, `Nb_Lignes_Lues`, `Nb_Lignes_Creees`, `Nb_Lignes_MAJ`, `Nb_Erreurs`, `Message`, `Force_Full`.
+
+Une ligne `Statut=EN_ATTENTE` est prise en charge automatiquement. Le moteur la passe à `EN_COURS`, synchronise la période, puis la termine en `TERMINEE` ou `ERREUR`.
+
+### Paramètres hebdomadaires dans `PARAM_SYNCHRO`
+
+Valeurs reconnues :
+
+- `SYNC_HEBDO_ACTIF` : `true` / `false` ;
+- `SYNC_HEBDO_JOUR` : `LUNDI` à `DIMANCHE` ;
+- `SYNC_HEBDO_HEURE` : heure locale `HH:MM` ;
+- `SYNC_HEBDO_PERIODE` : actuellement `ANNEE_EN_COURS` ;
+- `SYNC_AUTO_VALIDATION_ACTIF` : `true` / `false`.
+
+Avec les valeurs par défaut du portail (`DIMANCHE`, `22:00`), le premier cycle de polling exécuté le dimanche à partir de 22:00 crée une demande `HEBDO_ANNUELLE` couvrant du 1er janvier au 31 décembre de l'année en cours. Une clé persistante dans `/data/state.json` évite de la recréer plusieurs fois pendant la même semaine.
+
+### Validation d'une demande
+
+Quand une demande revient du Cockpit avec un statut validé/accepté, le moteur met à jour la demande locale puis relit `Cockpit.Presences` sur `Date_Debut` → `Date_Fin`, uniquement pour le `UUID_Ressource` concerné. Le code et le libellé du motif viennent de `Cockpit.Motifs_RH`, ce qui garantit que le planning Collab reflète le motif réellement enregistré dans le Cockpit.
+
+### Première mise en service
+
+Depuis Administration → Demandes de synchro dans le portail Collab, utiliser **Toute l'année en cours**, conserver `Force_Full=true`, puis déposer la demande. Au cycle suivant de RH-SYNC, elle doit passer `EN_ATTENTE → EN_COURS → TERMINEE`.
+
+
+
+## V3.10 — propagation AutoValidation
+
+- La colonne booléenne `Demandes_RH.AutoValidation` est désormais propagée de Collab vers Cockpit.
+- La valeur fait partie de l’empreinte de synchronisation : un changement `false ↔ true` déclenche une mise à jour Cockpit même si aucun autre champ de la demande ne change.
+- Cette version **ne déclenche aucune validation automatique** : Cockpit reçoit seulement le booléen et la demande reste dans son workflow normal.
+- La V3.9 reste incluse : clé métier du planning = `Ressource + Date`.
+
+## V3.9 — clé métier du planning
+
+La synchronisation `Cockpit.Presences -> PLANNING_PRESENCE` utilise désormais comme clé d'upsert le couple **Ressource locale + Date**. `Source_Presence_ID` (ou `Source_Feuille_ID`) est conservé uniquement comme information de traçabilité.
+
+Règles :
+- 0 ligne cible pour `Ressource+Date` : création ;
+- 1 ligne cible : mise à jour depuis Cockpit ;
+- plusieurs lignes cibles : conservation d'une ligne et suppression des doublons dans la période synchronisée ;
+- plusieurs lignes `Cockpit.Presences` pour la même `Ressource+Date` : conflit source journalisé, aucune valeur n'est choisie arbitrairement ;
+- lors d'une réconciliation, une clé locale absente du Cockpit est supprimée, sauf si la clé est en conflit côté Cockpit.
+
+`Cockpit.Presences` reste la source maître du planning.
